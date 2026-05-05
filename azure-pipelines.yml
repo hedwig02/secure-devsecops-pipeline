@@ -1,0 +1,94 @@
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  azureServiceConnection: 'sejal-app-connection'
+  resourceGroup: 'rg-security-sejal'
+  acrName: 'sejalsecurityacr'
+  acrLoginServer: 'sejalsecurityacr.azurecr.io'
+  imageName: 'devsecops-app'
+  webAppName: 'sejal-secure-app'
+  keyVaultName: 'sejal-sec-kv'
+
+stages:
+- stage: Build_Scan_Push
+  displayName: Build Scan and Push
+  jobs:
+  - job: BuildScanPush
+    steps:
+    - checkout: self
+
+    - task: AzureKeyVault@2
+      displayName: Get secrets from Key Vault
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        KeyVaultName: '$(keyVaultName)'
+        SecretsFilter: 'APP-SECRET'
+        RunAsPreJob: false
+
+    - script: |
+        echo "Secret loaded securely from Key Vault"
+      displayName: Verify Key Vault Secret Loaded
+
+    - task: AzureCLI@2
+      displayName: ACR Login
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az acr login --name $(acrName)
+
+    - script: |
+        docker build -t $(acrLoginServer)/$(imageName):$(Build.BuildId) .
+        docker tag $(acrLoginServer)/$(imageName):$(Build.BuildId) $(acrLoginServer)/$(imageName):latest
+      displayName: Build Docker Image
+
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+        echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install -y trivy
+      displayName: Install Trivy
+
+    - script: |
+        trivy image --severity HIGH,CRITICAL $(acrLoginServer)/$(imageName):$(Build.BuildId)
+      displayName: Scan Docker Image with Trivy
+
+    - script: |
+        docker push $(acrLoginServer)/$(imageName):$(Build.BuildId)
+        docker push $(acrLoginServer)/$(imageName):latest
+      displayName: Push Image to ACR
+
+- stage: Deploy
+  displayName: Deploy to Azure App Service
+  dependsOn: Build_Scan_Push
+  jobs:
+  - job: DeployWebApp
+    steps:
+    - task: AzureCLI@2
+      displayName: Configure Web App with ACR Image
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az webapp config container set \
+            --name $(webAppName) \
+            --resource-group $(resourceGroup) \
+            --docker-custom-image-name $(acrLoginServer)/$(imageName):latest \
+            --docker-registry-server-url https://$(acrLoginServer)
+
+          az webapp config appsettings set \
+            --name $(webAppName) \
+            --resource-group $(resourceGroup) \
+            --settings APP_SECRET="$(APP-SECRET)"
+
+          az webapp restart \
+            --name $(webAppName) \
+            --resource-group $(resourceGroup)
